@@ -9,3 +9,7 @@ license.workspace = true
 gamestream-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+cc = "1.0"
