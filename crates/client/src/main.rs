@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     stun: bool,
 
+    /// Redirigir flujo de video H.264 a stdout (útil en Linux para: `gamestream-client --stdout | mpv -`)
+    #[arg(long, default_value_t = false)]
+    stdout: bool,
+
     /// Activar estadísticas de telemetría y latencia en consola
     #[arg(short, long, default_value_t = true)]
     stats: bool,
@@ -68,7 +72,7 @@ async fn main() -> Result<()> {
         .context(format!("Dirección inválida de host: {}", cli.host))?;
 
     if cli.udp {
-        return run_udp_client(target_addr, cli.key, cli.stun).await;
+        return run_udp_client(target_addr, cli.key, cli.stun, cli.stdout).await;
     }
 
     let stream = match TcpStream::connect(target_addr).await {
@@ -232,12 +236,16 @@ async fn run_udp_client(
     target_addr: SocketAddr,
     key_hex: Option<String>,
     enable_stun: bool,
+    output_stdout: bool,
 ) -> Result<()> {
     use gamestream_net::crypto::{CryptoRole, CryptoSession};
     use gamestream_net::protocol::NetworkFeedback;
     use gamestream_net::transceiver::{NetEvent, UdpTransceiver};
+    use std::io::Write;
 
-    info!("=== MODO CLIENTE UDP ROBUSTO CON CIFRADO E2E Y ADAPTACIÓN DINÁMICA ===");
+    if !output_stdout {
+        info!("=== MODO CLIENTE UDP ROBUSTO CON CIFRADO E2E Y ADAPTACIÓN DINÁMICA ===");
+    }
 
     let key = if let Some(hex) = key_hex {
         Some(CryptoSession::key_from_hex(&hex).context("Clave de cifrado hex inválida")?)
@@ -246,10 +254,14 @@ async fn run_udp_client(
     };
 
     if enable_stun {
-        info!("Descubriendo IP pública mediante STUN para P2P NAT Traversal...");
+        if !output_stdout {
+            info!("Descubriendo IP pública mediante STUN para P2P NAT Traversal...");
+        }
         if let Ok(stun_sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
             if let Ok(pub_addr) = gamestream_net::stun::discover_public_endpoint(&stun_sock).await {
-                info!("Dirección pública STUN descubierta: {}", pub_addr);
+                if !output_stdout {
+                    info!("Dirección pública STUN descubierta: {}", pub_addr);
+                }
                 let _ = gamestream_net::stun::punch_hole(&stun_sock, target_addr, 5).await;
             }
         }
@@ -261,14 +273,16 @@ async fn run_udp_client(
     // Enviar paquete inicial de saludo/punch
     let _ = sender.socket_ref().send_to(b"GSPUNCH", target_addr).await;
 
-    println!("\n=========================================================================");
-    println!("RECEPTOR UDP ROBUSTO GAMESTREAM CLIENT (H.264 + OPUS + CHACHA20-POLY1305)");
-    println!("=========================================================================");
-    println!("Host de Destino:   {}", target_addr);
-    println!("Cifrado E2E:       {}", if key.is_some() { "ACTIVO (ChaCha20-Poly1305)" } else { "DESACTIVADO" });
-    println!("-------------------------------------------------------------------------");
-    println!("{:>5} | {:>9} | {:>9} | {:>10} | {:>8} | {:>10}", "Seg", "Video FPS", "Audio PPS", "Bitrate", "Pérdida", "Total Pkts");
-    println!("-------------------------------------------------------------------------");
+    if !output_stdout {
+        println!("\n=========================================================================");
+        println!("RECEPTOR UDP ROBUSTO GAMESTREAM CLIENT (H.264 + OPUS + CHACHA20-POLY1305)");
+        println!("=========================================================================");
+        println!("Host de Destino:   {}", target_addr);
+        println!("Cifrado E2E:       {}", if key.is_some() { "ACTIVO (ChaCha20-Poly1305)" } else { "DESACTIVADO" });
+        println!("-------------------------------------------------------------------------");
+        println!("{:>5} | {:>9} | {:>9} | {:>10} | {:>8} | {:>10}", "Seg", "Video FPS", "Audio PPS", "Bitrate", "Pérdida", "Total Pkts");
+        println!("-------------------------------------------------------------------------");
+    }
 
     let running = Arc::new(AtomicBool::new(true));
 
@@ -326,7 +340,12 @@ async fn run_udp_client(
                 video_frames_sec += 1;
                 total_packets += 1;
                 bytes_this_sec += frame.data.len();
-                std::hint::black_box(&frame.data);
+                if output_stdout {
+                    let _ = std::io::stdout().write_all(&frame.data);
+                    let _ = std::io::stdout().flush();
+                } else {
+                    std::hint::black_box(&frame.data);
+                }
             }
             Ok(Some(NetEvent::Audio(audio))) => {
                 audio_packets_sec += 1;
@@ -344,24 +363,26 @@ async fn run_udp_client(
             }
         }
 
-        let elapsed_sec = last_second.elapsed();
-        if elapsed_sec >= Duration::from_secs(1) {
-            let v_fps = (video_frames_sec as f64) / elapsed_sec.as_secs_f64();
-            let a_pps = (audio_packets_sec as f64) / elapsed_sec.as_secs_f64();
-            let mbps = (bytes_this_sec as f64 * 8.0) / (1_000_000.0 * elapsed_sec.as_secs_f64());
-            let sec_num = start_time.elapsed().as_secs();
+        if !output_stdout {
+            let elapsed_sec = last_second.elapsed();
+            if elapsed_sec >= Duration::from_secs(1) {
+                let v_fps = (video_frames_sec as f64) / elapsed_sec.as_secs_f64();
+                let a_pps = (audio_packets_sec as f64) / elapsed_sec.as_secs_f64();
+                let mbps = (bytes_this_sec as f64 * 8.0) / (1_000_000.0 * elapsed_sec.as_secs_f64());
+                let sec_num = start_time.elapsed().as_secs();
 
-            let loss_pct = receiver.current_loss_rate_bp() as f64 / 100.0;
+                let loss_pct = receiver.current_loss_rate_bp() as f64 / 100.0;
 
-            println!(
-                "{:>4}s | {:>9.1} | {:>9.1} | {:>7.2} Mbps | {:>7.2}% | {:>10}",
-                sec_num, v_fps, a_pps, mbps, loss_pct, total_packets
-            );
+                println!(
+                    "{:>4}s | {:>9.1} | {:>9.1} | {:>7.2} Mbps | {:>7.2}% | {:>10}",
+                    sec_num, v_fps, a_pps, mbps, loss_pct, total_packets
+                );
 
-            video_frames_sec = 0;
-            audio_packets_sec = 0;
-            bytes_this_sec = 0;
-            last_second = Instant::now();
+                video_frames_sec = 0;
+                audio_packets_sec = 0;
+                bytes_this_sec = 0;
+                last_second = Instant::now();
+            }
         }
     }
 
