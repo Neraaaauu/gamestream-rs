@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gamestream_capture::x11_shm::X11ShmCapture;
 use gamestream_capture::ScreenCapture;
 use gamestream_encode::h264::H264Encoder;
 use gamestream_encode::VideoEncoder;
@@ -85,11 +84,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    tracing::info!("=== Gamestream Host (Linux) - Fase 2 ===");
-    tracing::info!("Inicializando subsistema de captura X11 SHM...");
+    tracing::info!("=== Gamestream Host (Linux) ===");
+    tracing::info!("Detectando entorno gráfico e inicializando subsistema de captura...");
 
-    let mut capture = X11ShmCapture::new()
-        .context("No se pudo inicializar la captura X11 SHM")?;
+    let mut capture = gamestream_capture::create_default_capture()
+        .context("No se pudo inicializar la captura de pantalla (X11 / Wayland)")?;
 
     let (src_width, src_height) = capture.resolution();
     tracing::info!(

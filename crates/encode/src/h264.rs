@@ -107,7 +107,49 @@ impl H264Encoder {
             }
         }
 
-        // 2. Fallback a libx264 (Software universal optimizado)
+        // 2. Intentar NVIDIA NVENC por hardware para GPUs NVIDIA (h264_nvenc)
+        if active_codec_ctx.is_null() && (std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()) {
+            let nvenc_name = CString::new("h264_nvenc").unwrap();
+            let codec = unsafe { avcodec_find_encoder_by_name(nvenc_name.as_ptr()) };
+            if !codec.is_null() {
+                let codec_ctx = unsafe { avcodec_alloc_context3(codec) };
+                if !codec_ctx.is_null() {
+                    unsafe {
+                        (*codec_ctx).width = dst_width as i32;
+                        (*codec_ctx).height = dst_height as i32;
+                        (*codec_ctx).time_base = AVRational { num: 1, den: fps as i32 };
+                        (*codec_ctx).pix_fmt = nv12_fmt;
+                        (*codec_ctx).bit_rate = bitrate_bps;
+                        (*codec_ctx).gop_size = 600;
+
+                        let opt_ctx = codec_ctx as *mut std::ffi::c_void;
+                        let b_key = CString::new("bf").unwrap();
+                        av_opt_set_int(opt_ctx, b_key.as_ptr(), 0, 0);
+
+                        let preset_key = CString::new("preset").unwrap();
+                        let preset_val = CString::new("p1").unwrap();
+                        av_opt_set((*codec_ctx).priv_data, preset_key.as_ptr(), preset_val.as_ptr(), 0);
+
+                        let tune_key = CString::new("tune").unwrap();
+                        let tune_val = CString::new("ull").unwrap();
+                        av_opt_set((*codec_ctx).priv_data, tune_key.as_ptr(), tune_val.as_ptr(), 0);
+
+                        let ret_open = avcodec_open2(codec_ctx, codec, ptr::null_mut());
+                        if ret_open == 0 {
+                            info!("Encoder de HARDWARE NVIDIA NVENC (h264_nvenc) inicializado con éxito.");
+                            active_codec_ctx = codec_ctx;
+                            chosen_name = "h264_nvenc".to_string();
+                            is_hw = true;
+                        } else {
+                            warn!("avcodec_open2 falló para h264_nvenc: {}", get_error_string(ret_open));
+                            avcodec_free_context(&mut (codec_ctx as *mut _));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback a libx264 (Software universal optimizado)
         if active_codec_ctx.is_null() {
             active_hw_device = ptr::null_mut();
             active_hw_frames = ptr::null_mut();
