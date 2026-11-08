@@ -26,6 +26,7 @@ tokio = { version = "1.40", features = ["full"] }
 x11rb = { version = "0.14", features = ["shm", "allow-unsafe-code"] }
 libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
+chacha20poly1305 = "0.11.0"
 
 # Internal workspace crates
 gamestream-common = { path = "crates/common" }

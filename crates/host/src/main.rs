@@ -25,9 +25,25 @@ struct Cli {
     #[arg(short, long, default_value_t = false)]
     stream: bool,
 
-    /// Puerto TCP para streaming en red LAN
+    /// Puerto TCP o UDP para streaming
     #[arg(short, long, default_value_t = 8554)]
     port: u16,
+
+    /// Activar streaming UDP robusto con cifrado E2E ChaCha20-Poly1305 (Fase 7)
+    #[arg(long, default_value_t = false)]
+    udp: bool,
+
+    /// Clave de cifrado hex de 32 bytes (64 chars). Si se omite, se genera una aleatoria automáticamente.
+    #[arg(long)]
+    key: Option<String>,
+
+    /// Dirección IP:puerto del peer cliente para UDP (ej. 192.168.1.50:8555)
+    #[arg(long)]
+    peer: Option<String>,
+
+    /// Descubrir IP pública y puerto reflexivo mediante STUN (para jugar por Internet)
+    #[arg(long, default_value_t = false)]
+    stun: bool,
 
     /// Activar codificación H.264 (Fase 3: captura + reescalado + compresión)
     #[arg(short, long, default_value_t = false)]
@@ -42,7 +58,7 @@ struct Cli {
     height: u32,
 
     /// Bitrate objetivo en kbps
-    #[arg(short, long, default_value_t = 4500)]
+    #[arg(short = 'B', long, default_value_t = 4500)]
     bitrate: u32,
 
     /// Duración del benchmark en segundos
@@ -84,14 +100,31 @@ async fn main() -> Result<()> {
 
     let duration = cli.duration;
     let target_fps = cli.target_fps;
-    let encode_enabled = cli.encode || cli.stream;
+    let encode_enabled = cli.encode || cli.stream || cli.udp;
     let out_w = cli.width;
     let out_h = cli.height;
     let bitrate_bps = (cli.bitrate as i64) * 1000;
     let port = cli.port;
     let stream_mode = cli.stream;
+    let udp_mode = cli.udp;
+    let peer_arg = cli.peer;
+    let key_arg = cli.key;
+    let stun_arg = cli.stun;
 
-    if stream_mode {
+    if udp_mode {
+        tracing::info!("Modo Streaming UDP Robusto activado en puerto {}", port);
+        run_udp_stream(
+            capture,
+            out_w,
+            out_h,
+            target_fps,
+            bitrate_bps,
+            port,
+            peer_arg,
+            key_arg,
+            stun_arg,
+        ).await?;
+    } else if stream_mode {
         tracing::info!("Modo Streaming en LAN activado en puerto {}", port);
         run_lan_stream(capture, out_w, out_h, target_fps, bitrate_bps, port).await?;
     } else if cli.bench {
@@ -480,4 +513,275 @@ fn ctrlc_handler(running: Arc<AtomicBool>) {
             r.store(false, Ordering::Relaxed);
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_stream(
+    mut capture: impl ScreenCapture + 'static,
+    _initial_w: u32,
+    _initial_h: u32,
+    target_fps: u32,
+    bitrate_bps: i64,
+    port: u16,
+    peer_str: Option<String>,
+    key_hex: Option<String>,
+    enable_stun: bool,
+) -> Result<()> {
+    use std::net::SocketAddr;
+    use gamestream_audio::opus_enc::OpusAudioEncoder;
+    use gamestream_audio::pulse_cap::PulseAudioCapture;
+    use gamestream_net::adaptive::AdaptiveController;
+    use gamestream_net::crypto::{CryptoRole, CryptoSession};
+    use gamestream_net::protocol::NetworkFeedback;
+    use gamestream_net::transceiver::{NetEvent, UdpTransceiver};
+
+    // 1. Clave de cifrado extremo a extremo
+    let key = if let Some(hex) = key_hex {
+        CryptoSession::key_from_hex(&hex)
+            .context("Clave hexadecimal de cifrado inválida")?
+    } else {
+        CryptoSession::generate_key()
+    };
+    let hex_display = CryptoSession::key_to_hex(&key);
+
+    println!("\n============================================================");
+    println!("GAMESTREAM HOST - SERVIDOR UDP DE ULTRA BAJA LATENCIA (FASE 7)");
+    println!("============================================================");
+    println!("Clave de Cifrado E2E (ChaCha20-Poly1305):");
+    println!("  {}", hex_display);
+    println!("Proporciona esta clave a tu cliente para descifrado en tiempo real.");
+    println!("------------------------------------------------------------");
+
+    // 2. Consulta STUN si está habilitada
+    let local_bind = format!("0.0.0.0:{}", port);
+    if enable_stun {
+        println!("Consultando servidor STUN (RFC 5389) para NAT Traversal...");
+        match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(stun_sock) => {
+                match gamestream_net::stun::discover_public_endpoint(&stun_sock).await {
+                    Ok(public_endpoint) => {
+                        println!(">>> DIRECCIÓN PÚBLICA STUN DESCUBIERTA: {} <<<", public_endpoint);
+                        println!("Tus amigos pueden conectarse a esta IP:puerto por Internet sin abrir puertos.");
+                    }
+                    Err(e) => {
+                        tracing::warn!("STUN discovery no tuvo respuesta: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("No se pudo enlazar socket temporal STUN: {e}"),
+        }
+    }
+
+    // 3. Resolver dirección del Peer
+    let peer_addr = if let Some(ref p) = peer_str {
+        p.parse::<SocketAddr>()
+            .context(format!("Dirección de peer inválida: {}", p))?
+    } else {
+        println!("Escuchando en socket UDP {}...", local_bind);
+        println!("Esperando paquete de saludo o handshake del cliente...");
+        let socket = tokio::net::UdpSocket::bind(&local_bind)
+            .await
+            .context(format!("No se pudo enlazar socket UDP en {}", local_bind))?;
+
+        let mut buf = [0u8; 512];
+        let (_len, from_addr) = socket.recv_from(&mut buf).await
+            .context("Error recibiendo paquete inicial UDP")?;
+
+        println!("¡Cliente detectado desde {}! Estableciendo flujo P2P...", from_addr);
+        // Responder con punch
+        let _ = socket.send_to(b"GSPUNCH", from_addr).await;
+        // Soltar el socket para que UdpTransceiver lo enlace en el puerto
+        drop(socket);
+        from_addr
+    };
+
+    println!("Conexión P2P establecida con {}", peer_addr);
+    println!("============================================================\n");
+
+    let (sender, mut receiver) = UdpTransceiver::bind(&local_bind, peer_addr, Some(key), CryptoRole::Host).await?.into_split();
+
+    let (src_width, src_height) = capture.resolution();
+    let mut adaptive = AdaptiveController::new(0); // 720p60 inicial
+    let mut current_profile = adaptive.current_profile();
+    let mut current_bitrate = bitrate_bps.max(current_profile.rec_bitrate_bps);
+
+    let mut encoder = H264Encoder::new(
+        src_width,
+        src_height,
+        current_profile.width,
+        current_profile.height,
+        target_fps.max(1),
+        current_bitrate,
+    )?;
+
+    // Canal para recibir feedback de red desde la tarea asíncrona de recepción
+    let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::channel::<NetworkFeedback>(32);
+
+    // Inyector de entrada virtual en Linux
+    #[cfg(target_os = "linux")]
+    let mut input_injector = gamestream_input::injector::LinuxInputInjector::new().ok();
+
+    // Tarea receptora UDP de entrada y feedback de red (Zero locks)
+    let rx_running = Arc::new(AtomicBool::new(true));
+    let r_run = rx_running.clone();
+
+    tokio::spawn(async move {
+        let mut rx_buf = [0u8; 4096];
+        while r_run.load(Ordering::Relaxed) {
+            let event = receiver.recv_event(&mut rx_buf).await;
+
+            match event {
+                Ok(Some(NetEvent::Feedback(fb))) => {
+                    let _ = feedback_tx.send(fb).await;
+                }
+                Ok(Some(NetEvent::Input { kind, data })) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut inj) = input_injector {
+                        match kind {
+                            0x01 if data.len() >= 8 => {
+                                if let Some(m) = gamestream_input::protocol::MouseEvent::from_bytes(&data[..8]) {
+                                    let _ = inj.inject_mouse(&m);
+                                }
+                            }
+                            0x02 if data.len() >= 4 => {
+                                if let Some(k) = gamestream_input::protocol::KeyEvent::from_bytes(&data[..4]) {
+                                    let _ = inj.inject_keyboard(&k);
+                                }
+                            }
+                            0x03 if data.len() >= 16 => {
+                                if let Some(g) = gamestream_input::protocol::GamepadEvent::from_bytes(&data[..16]) {
+                                    let _ = inj.inject_gamepad(&g);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(Some(NetEvent::Ping { timestamp_us: _ })) => {
+                    // Ping recibido, conexión viva
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Iniciar hilo de captura y codificación Opus (10 ms / 100 pps)
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let audio_running = Arc::new(AtomicBool::new(true));
+    let a_run = audio_running.clone();
+
+    std::thread::spawn(move || {
+        let mut pulse = match PulseAudioCapture::new() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("No se pudo iniciar captura PulseAudio: {e}");
+                return;
+            }
+        };
+        let mut opus = match OpusAudioEncoder::new(48000, 2, 96000) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("No se pudo iniciar encoder Opus: {e}");
+                return;
+            }
+        };
+
+        while a_run.load(Ordering::Relaxed) {
+            if let Ok(pcm) = pulse.read_10ms_frame() {
+                if let Ok(opus_pkt) = opus.encode(&pcm) {
+                    if audio_tx.blocking_send(opus_pkt).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let running = Arc::new(AtomicBool::new(true));
+    ctrlc_handler(running.clone());
+
+    let frame_interval = Duration::from_micros(1_000_000 / (target_fps.max(1) as u64));
+    let mut frame_id = 1u32;
+    let mut audio_seq = 1u32;
+
+    tracing::info!("Bucle de streaming UDP activo transmitiendo a 60 FPS fijos...");
+
+    while running.load(Ordering::Relaxed) {
+        let frame_start = Instant::now();
+
+        // 1. Revisar si hay feedback de red del cliente para adaptación dinámica
+        while let Ok(fb) = feedback_rx.try_recv() {
+            if let Some(action) = adaptive.on_network_feedback(fb.loss_rate_bp, fb.rtt_ms) {
+                if action.profile_changed {
+                    tracing::info!(
+                        "Adaptación de Resolución: Reescalando dinámicamente a {} ({}x{}) @ 60 FPS",
+                        action.new_profile.name,
+                        action.new_profile.width,
+                        action.new_profile.height
+                    );
+                    current_profile = action.new_profile;
+                    current_bitrate = action.new_bitrate_bps;
+                    // Reconfigurar encoder
+                    if let Ok(new_enc) = H264Encoder::new(
+                        src_width,
+                        src_height,
+                        current_profile.width,
+                        current_profile.height,
+                        target_fps.max(1),
+                        current_bitrate,
+                    ) {
+                        encoder = new_enc;
+                    }
+                } else if action.new_bitrate_bps != current_bitrate {
+                    current_bitrate = action.new_bitrate_bps;
+                    tracing::info!("Adaptación de Bitrate: Ajustado a {:.2} Mbps", current_bitrate as f64 / 1_000_000.0);
+                }
+            }
+        }
+
+        // 2. Drenar y transmitir paquetes de audio Opus
+        while let Ok(opus_data) = audio_rx.try_recv() {
+            let _ = sender.send_audio_packet(audio_seq, &opus_data).await;
+            audio_seq = audio_seq.wrapping_add(1);
+        }
+
+        // 3. Capturar cuadro de video X11 SHM
+        let raw_frame = match capture.capture_frame() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Error de captura: {e}");
+                break;
+            }
+        };
+
+        // 4. Codificar frame con VA-API / software
+        let encoded_bytes = match encoder.encode(&raw_frame) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("Error codificando cuadro: {e}");
+                break;
+            }
+        };
+
+        if !encoded_bytes.is_empty() {
+            // Comprobar si es keyframe
+            let is_keyframe = encoded_bytes.windows(4).any(|w| w == [0, 0, 0, 1]);
+
+            if let Err(e) = sender.send_video_frame(frame_id, is_keyframe, &encoded_bytes).await {
+                tracing::warn!("Error transmitiendo video UDP: {e}");
+            }
+            frame_id = frame_id.wrapping_add(1);
+        }
+
+        // 5. Mantener ritmo de 60 FPS estricto
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_interval {
+            tokio::time::sleep(frame_interval - elapsed).await;
+        }
+    }
+
+    rx_running.store(false, Ordering::Relaxed);
+    audio_running.store(false, Ordering::Relaxed);
+    println!("Streaming UDP detenido limpiamente.");
+    Ok(())
 }

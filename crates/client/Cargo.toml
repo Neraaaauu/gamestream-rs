@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gamestream-common.workspace = true
+gamestream-net.workspace = true
 gamestream-input.workspace = true
 anyhow.workspace = true
 clap.workspace = true
