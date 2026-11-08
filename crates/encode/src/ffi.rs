@@ -145,11 +145,15 @@ pub struct AVCodecContext {
 }
 
 impl AVCodecContext {
+    /// # Safety
+    /// Caller must ensure that `frames_ctx` is a valid pointer to `AVBufferRef`.
     pub unsafe fn set_hw_frames_ctx(&mut self, frames_ctx: *mut AVBufferRef) {
         let ptr = (self as *mut Self as *mut u8).add(840) as *mut *mut AVBufferRef;
         *ptr = frames_ctx;
     }
 
+    /// # Safety
+    /// Caller must ensure that `device_ctx` is a valid pointer to `AVBufferRef`.
     pub unsafe fn set_hw_device_ctx(&mut self, device_ctx: *mut AVBufferRef) {
         let ptr = (self as *mut Self as *mut u8).add(864) as *mut *mut AVBufferRef;
         *ptr = device_ctx;

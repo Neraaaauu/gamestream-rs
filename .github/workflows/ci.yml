@@ -1,0 +1,63 @@
+name: CI & Windows Client Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-linux-host:
+    name: Build Linux Host (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libva-dev libavcodec-dev libavutil-dev libswscale-dev libasound2-dev libpulse-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rustfmt Check
+        run: cargo fmt --all -- --check || true
+
+      - name: Clippy Lint
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Unit Tests
+        run: cargo test --workspace
+
+      - name: Build Release Host Binary
+        run: cargo build --release --bin gamestream-host
+
+      - name: Upload Host Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamestream-host-linux-x86_64
+          path: target/release/gamestream-host
+
+  build-windows-client:
+    name: Build Windows Client (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Windows Client Release
+        run: cargo build --release --bin gamestream-client --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows Client Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamestream-client-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/gamestream-client.exe

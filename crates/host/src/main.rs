@@ -21,6 +21,14 @@ struct Cli {
     #[arg(short, long, default_value_t = false)]
     bench: bool,
 
+    /// Transmitir video en vivo a clientes por la red LAN (Fase 4)
+    #[arg(short, long, default_value_t = false)]
+    stream: bool,
+
+    /// Puerto TCP para streaming en red LAN
+    #[arg(short, long, default_value_t = 8554)]
+    port: u16,
+
     /// Activar codificación H.264 (Fase 3: captura + reescalado + compresión)
     #[arg(short, long, default_value_t = false)]
     encode: bool,
@@ -76,26 +84,106 @@ async fn main() -> Result<()> {
 
     let duration = cli.duration;
     let target_fps = cli.target_fps;
-    let encode_enabled = cli.encode;
+    let encode_enabled = cli.encode || cli.stream;
     let out_w = cli.width;
     let out_h = cli.height;
     let bitrate_bps = (cli.bitrate as i64) * 1000;
+    let port = cli.port;
+    let stream_mode = cli.stream;
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let encoder: Option<Box<dyn VideoEncoder>> = if encode_enabled {
-            let enc = H264Encoder::new(src_width, src_height, out_w, out_h, target_fps.max(1), bitrate_bps)
-                .context("Fallo al inicializar el encoder H.264")?;
-            Some(Box::new(enc))
-        } else {
-            None
-        };
+    if stream_mode {
+        tracing::info!("Modo Streaming en LAN activado en puerto {}", port);
+        run_lan_stream(capture, out_w, out_h, target_fps, bitrate_bps, port).await?;
+    } else if cli.bench {
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let encoder: Option<Box<dyn VideoEncoder>> = if encode_enabled {
+                let enc = H264Encoder::new(src_width, src_height, out_w, out_h, target_fps.max(1), bitrate_bps)
+                    .context("Fallo al inicializar el encoder H.264")?;
+                Some(Box::new(enc))
+            } else {
+                None
+            };
 
-        run_benchmark(&mut capture, encoder, duration, target_fps)
-    })
-    .await??;
+            run_benchmark(&mut capture, encoder, duration, target_fps)
+        })
+        .await??;
+    } else {
+        tracing::info!("Modo normal: ejecutando captura de prueba (5 segundos a 60 FPS)");
+        tracing::info!("Tip: Usa `gamestream-host --stream --port 8554` para transmitir en LAN al cliente Windows.");
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            run_benchmark(&mut capture, None, 5, target_fps)
+        })
+        .await??;
+    }
 
     tracing::info!("Ejecución finalizada con éxito.");
     Ok(())
+}
+
+async fn run_lan_stream(
+    mut capture: impl ScreenCapture + 'static,
+    out_w: u32,
+    out_h: u32,
+    target_fps: u32,
+    bitrate_bps: i64,
+    port: u16,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await
+        .context(format!("No se pudo enlazar socket TCP en {}", addr))?;
+
+    tracing::info!("============================================================");
+    tracing::info!("SERVIDOR LAN INICIADO: Escuchando en {}", addr);
+    tracing::info!("Conecta el cliente Windows con: gamestream-client.exe --host <IP>:{}", port);
+    tracing::info!("============================================================");
+
+    let (src_w, src_h) = capture.resolution();
+    let frame_interval = Duration::from_secs_f64(1.0 / (target_fps.max(1) as f64));
+
+    loop {
+        tracing::info!("Esperando conexión de un cliente...");
+        let (mut socket, client_addr) = listener.accept().await?;
+        tracing::info!("Cliente conectado desde: {}", client_addr);
+
+        let mut encoder = H264Encoder::new(src_w, src_h, out_w, out_h, target_fps.max(1), bitrate_bps)
+            .context("Error al inicializar encoder H.264 para cliente")?;
+
+        loop {
+            let start = Instant::now();
+
+            let frame = match capture.capture_frame() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("Error de captura: {e}");
+                    break;
+                }
+            };
+
+            let encoded = match encoder.encode(&frame) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("Error de codificación: {e}");
+                    break;
+                }
+            };
+
+            if !encoded.is_empty() {
+                let len_bytes = (encoded.len() as u32).to_be_bytes();
+                if socket.write_all(&len_bytes).await.is_err() || socket.write_all(&encoded).await.is_err() {
+                    tracing::warn!("Cliente {} desconectado.", client_addr);
+                    break;
+                }
+            }
+
+            let elapsed = start.elapsed();
+            if elapsed < frame_interval {
+                tokio::time::sleep(frame_interval - elapsed).await;
+            }
+        }
+    }
 }
 
 fn run_benchmark(
