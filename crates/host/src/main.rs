@@ -130,14 +130,16 @@ async fn run_lan_stream(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use gamestream_audio::opus_enc::OpusAudioEncoder;
+    use gamestream_audio::pulse_cap::PulseAudioCapture;
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await
         .context(format!("No se pudo enlazar socket TCP en {}", addr))?;
 
     tracing::info!("============================================================");
-    tracing::info!("SERVIDOR LAN INICIADO: Escuchando en {}", addr);
-    tracing::info!("Conecta el cliente Windows con: gamestream-client.exe --host <IP>:{}", port);
+    tracing::info!("SERVIDOR LAN A/V INICIADO: Escuchando en {}", addr);
+    tracing::info!("Transmitiendo Video H.264 + Audio Opus sincronizado a 10 ms");
     tracing::info!("============================================================");
 
     let (src_w, src_h) = capture.resolution();
@@ -151,9 +153,55 @@ async fn run_lan_stream(
         let mut encoder = H264Encoder::new(src_w, src_h, out_w, out_h, target_fps.max(1), bitrate_bps)
             .context("Error al inicializar encoder H.264 para cliente")?;
 
+        // Canal MPSC para audio en tiempo real desde el hilo de captura
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+        let audio_running = Arc::new(AtomicBool::new(true));
+        let a_run = audio_running.clone();
+
+        // Iniciar hilo de captura y codificación Opus (10 ms / 100 pps)
+        std::thread::spawn(move || {
+            let mut pulse = match PulseAudioCapture::new() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("No se pudo iniciar captura de audio PulseAudio: {e}");
+                    return;
+                }
+            };
+            let mut opus = match OpusAudioEncoder::new(48000, 2, 96000) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("No se pudo iniciar encoder Opus: {e}");
+                    return;
+                }
+            };
+
+            while a_run.load(Ordering::Relaxed) {
+                if let Ok(pcm) = pulse.read_10ms_frame() {
+                    if let Ok(opus_packet) = opus.encode(&pcm) {
+                        if audio_tx.blocking_send(opus_packet).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         loop {
             let start = Instant::now();
 
+            // 1. Drenar y enviar paquetes de audio Opus pendientes (Tipo 0x02)
+            while let Ok(audio_data) = audio_rx.try_recv() {
+                let mut header = [0u8; 5];
+                header[0] = 0x02; // Tipo: Audio Opus
+                let len_bytes = (audio_data.len() as u32).to_be_bytes();
+                header[1..5].copy_from_slice(&len_bytes);
+
+                if socket.write_all(&header).await.is_err() || socket.write_all(&audio_data).await.is_err() {
+                    break;
+                }
+            }
+
+            // 2. Capturar y codificar cuadro de video H.264 (Tipo 0x01)
             let frame = match capture.capture_frame() {
                 Ok(f) => f,
                 Err(e) => {
@@ -171,8 +219,12 @@ async fn run_lan_stream(
             };
 
             if !encoded.is_empty() {
+                let mut header = [0u8; 5];
+                header[0] = 0x01; // Tipo: Video H.264
                 let len_bytes = (encoded.len() as u32).to_be_bytes();
-                if socket.write_all(&len_bytes).await.is_err() || socket.write_all(&encoded).await.is_err() {
+                header[1..5].copy_from_slice(&len_bytes);
+
+                if socket.write_all(&header).await.is_err() || socket.write_all(&encoded).await.is_err() {
                     tracing::warn!("Cliente {} desconectado.", client_addr);
                     break;
                 }
@@ -183,6 +235,8 @@ async fn run_lan_stream(
                 tokio::time::sleep(frame_interval - elapsed).await;
             }
         }
+
+        audio_running.store(false, Ordering::Relaxed);
     }
 }
 

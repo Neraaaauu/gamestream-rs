@@ -65,53 +65,65 @@ async fn main() -> Result<()> {
         }
     };
 
-    println!("\n========================================================");
-    println!("RECEPTOR DE VIDEO LAN GAMESTREAM CLIENT");
-    println!("========================================================");
+    println!("\n=========================================================================");
+    println!("RECEPTOR MULTIMEDIA LAN GAMESTREAM CLIENT (VIDEO H.264 + AUDIO OPUS)");
+    println!("=========================================================================");
     println!("Host:              {}", target_addr);
-    println!("--------------------------------------------------------");
-    println!("{:>5} | {:>7} | {:>10} | {:>10}", "Seg", "FPS", "Bitrate", "Paquetes");
-    println!("--------------------------------------------------------");
+    println!("-------------------------------------------------------------------------");
+    println!("{:>5} | {:>9} | {:>9} | {:>10} | {:>12}", "Seg", "Video FPS", "Audio PPS", "Bitrate", "Total Paquetes");
+    println!("-------------------------------------------------------------------------");
 
-    let mut len_buf = [0u8; 4];
+    let mut header_buf = [0u8; 5];
     let mut total_packets = 0u64;
-    let mut packets_this_sec = 0u32;
+    let mut video_frames_sec = 0u32;
+    let mut audio_packets_sec = 0u32;
     let mut bytes_this_sec = 0usize;
     let mut last_second = Instant::now();
     let start_time = Instant::now();
 
     loop {
-        // Leer longitud del paquete H.264
-        if stream.read_exact(&mut len_buf).await.is_err() {
+        // Leer cabecera de 5 bytes: [tipo: 1 byte, longitud: 4 bytes]
+        if stream.read_exact(&mut header_buf).await.is_err() {
             info!("Conexión finalizada por el host.");
             break;
         }
 
-        let packet_len = u32::from_be_bytes(len_buf) as usize;
+        let packet_type = header_buf[0];
+        let packet_len = u32::from_be_bytes([
+            header_buf[1], header_buf[2], header_buf[3], header_buf[4]
+        ]) as usize;
+
         let mut packet_data = vec![0u8; packet_len];
         if stream.read_exact(&mut packet_data).await.is_err() {
-            warn!("Error al leer datos del frame");
+            warn!("Error al leer datos del paquete");
             break;
         }
 
         total_packets += 1;
-        packets_this_sec += 1;
-        bytes_this_sec += 4 + packet_len;
+        bytes_this_sec += 5 + packet_len;
+
+        if packet_type == 0x01 {
+            video_frames_sec += 1;
+        } else if packet_type == 0x02 {
+            audio_packets_sec += 1;
+        }
 
         std::hint::black_box(&packet_data);
 
         let elapsed_sec = last_second.elapsed();
         if elapsed_sec >= Duration::from_secs(1) {
-            let fps = (packets_this_sec as f64) / elapsed_sec.as_secs_f64();
+            let v_fps = (video_frames_sec as f64) / elapsed_sec.as_secs_f64();
+            let a_pps = (audio_packets_sec as f64) / elapsed_sec.as_secs_f64();
             let mbps = (bytes_this_sec as f64 * 8.0) / (1_000_000.0 * elapsed_sec.as_secs_f64());
             let sec_num = start_time.elapsed().as_secs();
 
             println!(
-                "{:>4}s | {:>7.1} | {:>6.2} Mbps | {:>10}",
-                sec_num, fps, mbps, total_packets
+                "{:>4}s | {:>9.1} | {:>9.1} | {:>7.2} Mbps | {:>12}",
+                sec_num, v_fps, a_pps, mbps, total_packets
             );
 
-            packets_this_sec = 0;
+            video_frames_sec = 0;
+            audio_packets_sec = 0;
             bytes_this_sec = 0;
             last_second = Instant::now();
         }

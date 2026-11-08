@@ -1,3 +1,8 @@
+pub mod ffi;
+pub mod opus_enc;
+pub mod pulse_cap;
+
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -8,7 +13,9 @@ pub enum AudioError {
     StreamError(String),
 }
 
-pub trait AudioCapture: Send {
-    fn start(&mut self) -> Result<(), AudioError>;
-    fn stop(&mut self) -> Result<(), AudioError>;
+#[derive(Debug, Clone)]
+pub struct AudioPacket {
+    pub sequence: u64,
+    pub timestamp: Instant,
+    pub data: Vec<u8>,
 }
