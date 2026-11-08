@@ -172,14 +172,39 @@ impl LinuxInputInjector {
             None => return Ok(()),
         };
 
-        let events = [
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, event.lx as i32),
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, event.ly as i32),
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RX.0, event.rx as i32),
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RY.0, event.ry as i32),
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Z.0, event.lt as i32),
-            InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RZ.0, event.rt as i32),
-        ];
+        let mut events = Vec::with_capacity(20);
+
+        // Ejes analógicos y Gatillos (LT / RT)
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, event.lx as i32));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, event.ly as i32));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RX.0, event.rx as i32));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RY.0, event.ry as i32));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Z.0, event.lt as i32));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_RZ.0, event.rt as i32));
+
+        // Cruceta D-Pad (ABS_HAT0X y ABS_HAT0Y)
+        let hat_x = if (event.buttons & 0x0008) != 0 { 1 } else if (event.buttons & 0x0004) != 0 { -1 } else { 0 };
+        let hat_y = if (event.buttons & 0x0002) != 0 { 1 } else if (event.buttons & 0x0001) != 0 { -1 } else { 0 };
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_HAT0X.0, hat_x));
+        events.push(InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_HAT0Y.0, hat_y));
+
+        // Botones de acción estándar XInput
+        let btn = |code: KeyCode, mask: u16| {
+            let val = if (event.buttons & mask) != 0 { 1 } else { 0 };
+            InputEvent::new(evdev::EventType::KEY.0, code.0, val)
+        };
+
+        events.push(btn(KeyCode::BTN_SOUTH, 0x1000)); // A
+        events.push(btn(KeyCode::BTN_EAST, 0x2000));  // B
+        events.push(btn(KeyCode::BTN_NORTH, 0x4000)); // X
+        events.push(btn(KeyCode::BTN_WEST, 0x8000));  // Y
+        events.push(btn(KeyCode::BTN_TL, 0x0100));    // LB (Bumper Izquierdo)
+        events.push(btn(KeyCode::BTN_TR, 0x0200));    // RB (Bumper Derecho)
+        events.push(btn(KeyCode::BTN_SELECT, 0x0020));// Back / View
+        events.push(btn(KeyCode::BTN_START, 0x0010)); // Start / Menu
+        events.push(btn(KeyCode::BTN_THUMBL, 0x0040));// LS (Click Stick Izq)
+        events.push(btn(KeyCode::BTN_THUMBR, 0x0080));// RS (Click Stick Der)
+        events.push(btn(KeyCode::BTN_MODE, 0x0400));  // Botón Guía Xbox
 
         pad.emit(&events).map_err(|e| InputError::EmitFailed(e.to_string()))
     }

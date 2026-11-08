@@ -105,28 +105,12 @@ async fn main() -> Result<()> {
     let bitrate_bps = (cli.bitrate as i64) * 1000;
     let port = cli.port;
     let stream_mode = cli.stream;
-    let udp_mode = cli.udp;
     let peer_arg = cli.peer;
     let key_arg = cli.key;
     let stun_arg = cli.stun;
 
-    if udp_mode {
-        tracing::info!("Modo Streaming UDP Robusto activado en puerto {}", port);
-        run_udp_stream(
-            capture,
-            out_w,
-            out_h,
-            target_fps,
-            bitrate_bps,
-            port,
-            peer_arg,
-            key_arg,
-            stun_arg,
-        ).await?;
-    } else if stream_mode {
-        tracing::info!("Modo Streaming en LAN activado en puerto {}", port);
-        run_lan_stream(capture, out_w, out_h, target_fps, bitrate_bps, port).await?;
-    } else if cli.bench {
+    if cli.bench {
+        tracing::info!("Modo benchmark activado: midiendo rendimiento por {} segundos", duration);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let encoder: Option<Box<dyn VideoEncoder>> = if encode_enabled {
                 let enc = H264Encoder::new(src_width, src_height, out_w, out_h, target_fps.max(1), bitrate_bps)
@@ -139,13 +123,23 @@ async fn main() -> Result<()> {
             run_benchmark(&mut capture, encoder, duration, target_fps)
         })
         .await??;
+    } else if stream_mode {
+        tracing::info!("Modo Streaming en LAN (TCP) activado en puerto {}", port);
+        run_lan_stream(capture, out_w, out_h, target_fps, bitrate_bps, port).await?;
     } else {
-        tracing::info!("Modo normal: ejecutando captura de prueba (5 segundos a 60 FPS)");
-        tracing::info!("Tip: Usa `gamestream-host --stream --port 8554` para transmitir en LAN al cliente Windows.");
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            run_benchmark(&mut capture, None, 5, target_fps)
-        })
-        .await??;
+        // MODO POR DEFECTO: Streaming UDP robusto continuo con cifrado y STUN
+        tracing::info!("Iniciando Gamestream Host continuo en puerto UDP {}", port);
+        run_udp_stream(
+            capture,
+            out_w,
+            out_h,
+            target_fps,
+            bitrate_bps,
+            port,
+            peer_arg,
+            key_arg,
+            stun_arg || true, // Activar STUN por defecto para descubrir IP de Internet
+        ).await?;
     }
 
     tracing::info!("Ejecución finalizada con éxito.");
