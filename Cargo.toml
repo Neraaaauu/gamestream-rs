@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/capture",
+    "crates/encode",
+    "crates/audio",
+    "crates/net",
+    "crates/input",
+    "crates/host",
+    "crates/client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Adrian", "Antigravity Engineering"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.40", features = ["full"] }
+x11rb = { version = "0.14", features = ["shm", "allow-unsafe-code"] }
+libc = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+
+# Internal workspace crates
+gamestream-common = { path = "crates/common" }
+gamestream-capture = { path = "crates/capture" }
+gamestream-encode = { path = "crates/encode" }
+gamestream-audio = { path = "crates/audio" }
+gamestream-net = { path = "crates/net" }
+gamestream-input = { path = "crates/input" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

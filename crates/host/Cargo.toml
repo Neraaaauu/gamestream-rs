@@ -1,0 +1,25 @@
+[package]
+name = "gamestream-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gamestream-host"
+path = "src/main.rs"
+
+[dependencies]
+gamestream-common.workspace = true
+gamestream-capture.workspace = true
+gamestream-encode.workspace = true
+gamestream-audio.workspace = true
+gamestream-net.workspace = true
+gamestream-input.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+libc.workspace = true
