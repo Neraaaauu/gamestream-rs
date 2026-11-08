@@ -9,3 +9,6 @@ license.workspace = true
 gamestream-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"

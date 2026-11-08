@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
     let target_addr: SocketAddr = cli.host.parse()
         .context(format!("Dirección inválida de host: {}", cli.host))?;
 
-    let mut stream = match TcpStream::connect(target_addr).await {
+    let stream = match TcpStream::connect(target_addr).await {
         Ok(s) => {
             info!("¡Conectado exitosamente al host {}!", target_addr);
             s
@@ -64,6 +66,31 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
+
+    let (mut stream_rx, mut stream_tx) = stream.into_split();
+
+    // Tarea de envío de Input en tiempo real hacia el host (60 Hz)
+    let send_running = Arc::new(AtomicBool::new(true));
+    let s_run = send_running.clone();
+    tokio::spawn(async move {
+        use gamestream_input::protocol::MouseEvent;
+        use tokio::io::AsyncWriteExt;
+
+        let mut interval = tokio::time::interval(Duration::from_millis(16));
+        while s_run.load(Ordering::Relaxed) {
+            interval.tick().await;
+
+            let mouse = MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 };
+            let data = mouse.to_bytes();
+            let mut header = [0u8; 5];
+            header[0] = 0x03; // Tipo Mouse
+            header[1..5].copy_from_slice(&(data.len() as u32).to_be_bytes());
+
+            if stream_tx.write_all(&header).await.is_err() || stream_tx.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
 
     println!("\n=========================================================================");
     println!("RECEPTOR MULTIMEDIA LAN GAMESTREAM CLIENT (VIDEO H.264 + AUDIO OPUS)");
@@ -83,7 +110,7 @@ async fn main() -> Result<()> {
 
     loop {
         // Leer cabecera de 5 bytes: [tipo: 1 byte, longitud: 4 bytes]
-        if stream.read_exact(&mut header_buf).await.is_err() {
+        if stream_rx.read_exact(&mut header_buf).await.is_err() {
             info!("Conexión finalizada por el host.");
             break;
         }
@@ -94,7 +121,7 @@ async fn main() -> Result<()> {
         ]) as usize;
 
         let mut packet_data = vec![0u8; packet_len];
-        if stream.read_exact(&mut packet_data).await.is_err() {
+        if stream_rx.read_exact(&mut packet_data).await.is_err() {
             warn!("Error al leer datos del paquete");
             break;
         }
@@ -129,6 +156,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    send_running.store(false, Ordering::Relaxed);
     Ok(())
 }
 

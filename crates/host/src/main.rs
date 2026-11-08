@@ -147,11 +147,62 @@ async fn run_lan_stream(
 
     loop {
         tracing::info!("Esperando conexión de un cliente...");
-        let (mut socket, client_addr) = listener.accept().await?;
+        let (socket, client_addr) = listener.accept().await?;
         tracing::info!("Cliente conectado desde: {}", client_addr);
+
+        let (mut socket_rx, mut socket_tx) = socket.into_split();
 
         let mut encoder = H264Encoder::new(src_w, src_h, out_w, out_h, target_fps.max(1), bitrate_bps)
             .context("Error al inicializar encoder H.264 para cliente")?;
+
+        // Tarea asíncrona para recibir e inyectar Input desde el cliente (Mouse, Teclado, Mando)
+        let input_running = Arc::new(AtomicBool::new(true));
+        let in_run = input_running.clone();
+        tokio::spawn(async move {
+            use gamestream_input::injector::LinuxInputInjector;
+            use gamestream_input::protocol::{GamepadEvent, KeyEvent, MouseEvent};
+            use tokio::io::AsyncReadExt;
+
+            let mut injector = match LinuxInputInjector::new() {
+                Ok(inj) => inj,
+                Err(e) => {
+                    tracing::warn!("No se pudo inicializar inyector de entrada: {e}");
+                    return;
+                }
+            };
+
+            let mut header = [0u8; 5];
+            while in_run.load(Ordering::Relaxed) {
+                if socket_rx.read_exact(&mut header).await.is_err() {
+                    break;
+                }
+                let p_type = header[0];
+                let p_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+                let mut data = vec![0u8; p_len];
+                if socket_rx.read_exact(&mut data).await.is_err() {
+                    break;
+                }
+
+                match p_type {
+                    0x03 => {
+                        if let Some(m_ev) = MouseEvent::from_bytes(&data) {
+                            let _ = injector.inject_mouse(&m_ev);
+                        }
+                    }
+                    0x04 => {
+                        if let Some(k_ev) = KeyEvent::from_bytes(&data) {
+                            let _ = injector.inject_keyboard(&k_ev);
+                        }
+                    }
+                    0x05 => {
+                        if let Some(g_ev) = GamepadEvent::from_bytes(&data) {
+                            let _ = injector.inject_gamepad(&g_ev);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
 
         // Canal MPSC para audio en tiempo real desde el hilo de captura
         let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -196,7 +247,7 @@ async fn run_lan_stream(
                 let len_bytes = (audio_data.len() as u32).to_be_bytes();
                 header[1..5].copy_from_slice(&len_bytes);
 
-                if socket.write_all(&header).await.is_err() || socket.write_all(&audio_data).await.is_err() {
+                if socket_tx.write_all(&header).await.is_err() || socket_tx.write_all(&audio_data).await.is_err() {
                     break;
                 }
             }
@@ -224,7 +275,7 @@ async fn run_lan_stream(
                 let len_bytes = (encoded.len() as u32).to_be_bytes();
                 header[1..5].copy_from_slice(&len_bytes);
 
-                if socket.write_all(&header).await.is_err() || socket.write_all(&encoded).await.is_err() {
+                if socket_tx.write_all(&header).await.is_err() || socket_tx.write_all(&encoded).await.is_err() {
                     tracing::warn!("Cliente {} desconectado.", client_addr);
                     break;
                 }
@@ -237,6 +288,7 @@ async fn run_lan_stream(
         }
 
         audio_running.store(false, Ordering::Relaxed);
+        input_running.store(false, Ordering::Relaxed);
     }
 }
 

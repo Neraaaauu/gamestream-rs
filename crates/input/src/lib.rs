@@ -1,3 +1,8 @@
+pub mod protocol;
+
+#[cfg(target_os = "linux")]
+pub mod injector;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
